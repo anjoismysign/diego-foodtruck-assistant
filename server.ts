@@ -249,7 +249,15 @@ Responde de forma muy breve y directa.`,
       }
     });
 
-    bot.launch().then(() => console.log("Telegram Bot started"));
+    bot.launch()
+      .then(() => {
+        console.log("✅ Telegram Bot started successfully");
+      })
+      .catch((err) => {
+        console.error("❌ Telegram Bot failed to start:");
+        console.error(err.message);
+        console.log("The Dashboard is still running. Check your IPv6/DNS settings.");
+      });
     process.once("SIGINT", () => bot.stop("SIGINT"));
     process.once("SIGTERM", () => bot.stop("SIGTERM"));
   }
