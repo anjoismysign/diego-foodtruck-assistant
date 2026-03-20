@@ -39,7 +39,9 @@ async function startServer() {
   app.use(express.json());
   const PORT = 3000;
 
-  const WHITELIST = [7909565335];
+  const SYSTEM_PROMPT = fs.readFileSync("SYSTEM_PROMPT.txt", "utf-8");
+
+  const WHITELIST = fs.readFileSync("WHITELIST.txt", "utf-8").split("\n").map(Number).filter(Boolean);
 
   const db = new Database("history.db");
   db.exec(`
@@ -245,7 +247,7 @@ async function startServer() {
       let currentMessages = [...historyForTurn, { role: "user" as const, content: userText }];
       const nowUnix = Math.floor(Date.now() / 1000);
 
-      const systemPrompt = fs.readFileSync("SYSTEM_PROMPT.txt", "utf-8").replace("%timestamp%", nowUnix.toString()).replace("%audioId%", audioId ? `Audio ID: ${audioId}` : "Sin audio");
+      const systemPrompt = SYSTEM_PROMPT.replace("%timestamp%", nowUnix.toString()).replace("%audioId%", audioId ? `Audio ID: ${audioId}` : "Sin audio");
 
       try {
         console.log(`[LLM Request] Enviando ${currentMessages.length} mensajes. System length: ${systemPrompt.length}`);
