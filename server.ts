@@ -2,24 +2,20 @@ import "dotenv/config";
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
-import { Telegraf, Context } from "telegraf";
+import { Telegraf } from "telegraf";
 import { message } from "telegraf/filters";
 import Groq from "groq-sdk";
-import OpenAI from "openai";
+import Anthropic from "@anthropic-ai/sdk";
 import axios from "axios";
 import fs from "fs";
-import { promisify } from "util";
-import { pipeline } from "stream";
 import Database from "better-sqlite3";
 import jwt from "jsonwebtoken";
+import { Server } from "socket.io";
+import { createServer } from "http";
 
-const streamPipeline = promisify(pipeline);
-
-// ─── Auth config ────────────────────────────────────────────────────────────
 const JWT_SECRET = process.env.JWT_SECRET || "caravana-rosa-secret-2026";
-const ADMIN_USER = "admin";
-const ADMIN_PASS = "kadjo5-davjar-Borkyd";
-// ────────────────────────────────────────────────────────────────────────────
+const ADMIN_USER = process.env.ADMIN_USER || "admin";
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "kadjo5-davjar-Borkyd";
 
 function authMiddleware(req: express.Request, res: express.Response, next: express.NextFunction) {
   const token = req.headers.authorization?.split(" ")[1];
@@ -37,6 +33,9 @@ function authMiddleware(req: express.Request, res: express.Response, next: expre
 
 async function startServer() {
   const app = express();
+  const httpServer = createServer(app);
+  const io = new Server(httpServer);
+
   app.use(express.json());
   const PORT = 3000;
 
@@ -44,37 +43,101 @@ async function startServer() {
 
   const db = new Database("history.db");
   db.exec(`
-    CREATE TABLE IF NOT EXISTS mensajes (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      chat_id INTEGER,
-      role TEXT,
-      content TEXT,
-      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE IF NOT EXISTS pedidos (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      chat_id INTEGER,
-      customer TEXT NOT NULL,
-      amount REAL NOT NULL,
-      timestamp INTEGER NOT NULL,
-      paid INTEGER NOT NULL DEFAULT 0
-    );
-  `);
+  CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER,
+    role TEXT,
+    content TEXT, 
+    is_transaction_end INTEGER DEFAULT 0, 
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS customers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    nombre TEXT,
+    alias TEXT
+  );
+  CREATE TABLE IF NOT EXISTS audios (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    telegram_file_id TEXT UNIQUE,
+    audio_data BLOB NOT NULL,
+    mime_type TEXT DEFAULT 'audio/ogg'
+  );
+  CREATE TABLE IF NOT EXISTS transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    customer_id INTEGER NOT NULL,
+    amount REAL NOT NULL,
+    description TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    audio_id INTEGER,
+    timestamp INTEGER NOT NULL,
+    FOREIGN KEY(customer_id) REFERENCES customers(id),
+    FOREIGN KEY(audio_id) REFERENCES audios(id)
+  );
+`);
 
-  const saveMessage = (chatId: number, role: string, content: string) => {
-    db.prepare("INSERT INTO mensajes (chat_id, role, content) VALUES (?, ?, ?)").run(chatId, role, content);
+  const saveMessage = (
+    chatId: number,
+    role: "user" | "assistant",
+    content: Anthropic.MessageParam['content'],
+    isTransactionEnd: boolean = false
+  ) => {
+    db.prepare(
+      "INSERT INTO messages (chat_id, role, content, is_transaction_end) VALUES (?, ?, ?, ?)"
+    ).run(chatId, role, JSON.stringify(content), isTransactionEnd ? 1 : 0);
   };
 
-  const getHistory = (chatId: number) => {
-    const rows = db.prepare("SELECT role, content FROM mensajes WHERE chat_id = ? ORDER BY timestamp DESC LIMIT 10").all(chatId) as { role: string; content: string }[];
-    return rows.reverse();
+  const getHistory = (chatId: number): Anthropic.MessageParam[] => {
+    const rows = db.prepare(
+      "SELECT role, content, is_transaction_end FROM messages WHERE chat_id = ? ORDER BY id DESC LIMIT 30"
+    ).all(chatId) as { role: "user" | "assistant"; content: string; is_transaction_end: number }[];
+
+    const history: Anthropic.MessageParam[] = [];
+
+    const endIdx = rows.findIndex(r => r.is_transaction_end === 1);
+    const rowsToUse = endIdx !== -1 ? rows.slice(0, endIdx + 1) : rows;
+
+    for (const row of rowsToUse.reverse()) {
+      let content = JSON.parse(row.content);
+
+      const last = history[history.length - 1];
+      if (last && last.role === row.role) {
+        if (typeof last.content === "string" && typeof content === "string") {
+          last.content = last.content + "\n" + content;
+        } else {
+          const lastBlocks = Array.isArray(last.content) ? last.content : [{ type: "text", text: last.content }];
+          const curBlocks = Array.isArray(content) ? content : [{ type: "text", text: content }];
+          last.content = [...lastBlocks, ...curBlocks] as any;
+        }
+        continue;
+      }
+
+      history.push({ role: row.role, content });
+      if (row.is_transaction_end === 1) {
+      }
+    }
+    while (history.length > 0 && history[0].role !== "user") {
+      const removed = history.shift();
+      if (removed && Array.isArray(removed.content)) {
+        const hasToolUse = (removed.content as any[]).some((b: any) => b.type === 'tool_use');
+        if (hasToolUse && history.length > 0 && (history[0] as any).role === 'user' && Array.isArray(history[0].content)) {
+          const onlyToolResults = (history[0].content as any[]).every((b: any) => b.type === 'tool_result');
+          if (onlyToolResults) {
+            history.shift();
+          }
+        }
+      }
+    }
+
+    console.log(`[History] Retornando ${history.length} mensajes para el chat ${chatId}`);
+    return history;
   };
 
   const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-  const openAi = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY,
-    baseURL: process.env.OPENAI_BASE_URL,
+  const anthropic = new Anthropic({
+    apiKey: process.env.ANTHROPIC_API_KEY,
+    baseURL: process.env.ANTHROPIC_BASE_URL,
   });
+  const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-3-5-sonnet-20240620";
 
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
   if (!botToken) {
@@ -88,184 +151,220 @@ async function startServer() {
         return next();
       }
       console.log(`Intento de acceso denegado para el ID: ${userId}`);
-      await ctx.reply(
-        `⛔ Acceso denegado.\n\nTu ID de usuario es: ${userId}\nPor favor, contacta al administrador para ser agregado como operador.`
-      );
+      await ctx.reply(`⛔ Acceso denegado.\n\nTu ID de usuario es: ${userId}`);
     });
 
-    const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
+    const tools: Anthropic.Tool[] = [
       {
-        type: "function",
-        function: {
-          name: "registrar_pedido",
-          description: "Registra un pedido de un cliente. TODOS los parámetros son obligatorios. Si el operador no menciona alguno, debes pedírselo antes de llamar esta función.",
-          parameters: {
-            type: "object",
-            properties: {
-              customer: { type: "string", description: "Nombre del cliente" },
-              amount: { type: "number", description: "Monto del pedido en colones" },
-              timestamp: { type: "integer", description: "Timestamp unix del momento del pedido" },
-              paid: { type: "boolean", description: "true si el cliente pagó de inmediato, false si es fiado" },
-            },
-            required: ["customer", "amount", "timestamp", "paid"],
+        name: "registrar_transaccion",
+        description: "Registra una transacción.",
+        input_schema: {
+          type: "object",
+          properties: {
+            customer_id: { type: "integer", description: "ID numérico del cliente" },
+            amount: { type: "number", description: "Monto del pedido" },
+            timestamp: { type: "integer", description: "Timestamp unix" },
+            description: { type: "string", description: "Descripción del pedido" },
+            audio_id: { type: "integer", description: "ID del audio" },
+            status: { type: "integer", description: "0 = fiado, 1 = pagado al instante, 2 = abono, 3 = anticipo" },
+          },
+          required: ["customer_id", "amount", "timestamp", "description", "status"],
+        },
+      },
+      {
+        name: "registrar_cliente",
+        description: "Crea un nuevo cliente. Requiere nombre o alias.",
+        input_schema: {
+          type: "object",
+          properties: {
+            nombre: { type: "string", description: "Nombre oficial" },
+            alias: { type: "array", items: { type: "string" }, description: "Apodos" },
           },
         },
       },
       {
-        type: "function",
-        function: {
-          name: "obtener_reporte",
-          description: "Muestra el resumen de pedidos de las últimas 24 horas: total vendido, total cobrado en caja y cuentas pendientes.",
-          parameters: {
-            type: "object",
-            properties: {
-              customer: { type: "string", description: "Opcional: filtrar por nombre de cliente" },
-            },
+        name: "buscar_cliente",
+        description: "Busca clientes por nombre o alias.",
+        input_schema: {
+          type: "object",
+          properties: {
+            query: { type: "string", description: "Nombre o apodo" },
           },
+          required: ["query"],
         },
       },
     ];
 
-    const handleToolCall = async (chatId: number, toolCall: any) => {
-      if (!toolCall.function) return "Error: Tool call is not a function.";
-      const { name, arguments: argsString } = toolCall.function;
-      const args = JSON.parse(argsString);
+    const handleToolCall = async (chatId: number, name: string, args: any) => {
+      try {
+        if (name === "registrar_transaccion") {
+          const status = args.status;
+          const customer_id = args.customer_id;
+          const amount = args.amount;
+          const timestamp = args.timestamp;
+          const description = args.description;
+          const audio_id = args.audio_id; //nullable
 
-      if (name === "registrar_pedido") {
-        db.prepare(
-          "INSERT INTO pedidos (chat_id, customer, amount, timestamp, paid) VALUES (?, ?, ?, ?, ?)"
-        ).run(chatId, args.customer, args.amount, args.timestamp, args.paid ? 1 : 0);
-        return args.paid
-          ? `✅ Pedido registrado: ${args.customer} pagó ₡${args.amount.toLocaleString()} al contado.`
-          : `📌 Pedido fiado: ${args.customer} debe ₡${args.amount.toLocaleString()}.`;
-      }
-
-      if (name === "obtener_reporte") {
-        const last24h = Math.floor(Date.now() / 1000) - 86400;
-        let query = "SELECT * FROM pedidos WHERE chat_id = ? AND timestamp > ?";
-        const params: any[] = [chatId, last24h];
-        if (args.customer) {
-          query += " AND LOWER(customer) = LOWER(?)";
-          params.push(args.customer);
+          db.prepare("INSERT INTO transactions (customer_id, amount, timestamp, description, audio_id, status) VALUES (?, ?, ?, ?, ?, ?)")
+            .run(customer_id, amount, timestamp, description, audio_id, status);
+          io.emit("transaction_updated");
+          return `✅ Transacción registrada para el cliente bajo la ID ${args.customer_id}.`;
         }
-        const pedidos = db.prepare(query).all(...params) as any[];
-        const totalVentas = pedidos.reduce((sum: number, p: any) => sum + p.amount, 0);
-        const totalCobrado = pedidos.filter((p: any) => p.paid).reduce((sum: number, p: any) => sum + p.amount, 0);
-        const totalPendiente = pedidos.filter((p: any) => !p.paid).reduce((sum: number, p: any) => sum + p.amount, 0);
-        const pendientesPorCliente = pedidos
-          .filter((p: any) => !p.paid)
-          .reduce((acc: Record<string, number>, p: any) => {
-            acc[p.customer] = (acc[p.customer] || 0) + p.amount;
-            return acc;
-          }, {});
-        const desglose = Object.entries(pendientesPorCliente)
-          .map(([name, amount]) => `- ${name}: ₡${(amount as number).toLocaleString()}`)
-          .join("\n");
-        return `📊 Reporte últimas 24h:
-Total vendido: ₡${totalVentas.toLocaleString()}
-En caja (contado): ₡${totalCobrado.toLocaleString()}
-Pendiente por cobrar: ₡${totalPendiente.toLocaleString()}
 
-${desglose ? `Cuentas pendientes:\n${desglose}` : "Sin cuentas pendientes."}`;
+        if (name === "registrar_cliente") {
+          const aliasStr = args.alias ? JSON.stringify(args.alias) : "[]";
+          const info = db.prepare("INSERT INTO customers (nombre, alias) VALUES (?, ?)")
+            .run(args.nombre || null, aliasStr);
+          return `✅ Cliente registrado. ID: ${info.lastInsertRowid}.`;
+        }
+
+        if (name === "buscar_cliente") {
+          const query = args.query.toLowerCase();
+          const allCustomers = db.prepare("SELECT * FROM customers").all() as any[];
+          const matches = allCustomers.filter(c => {
+            const n = c.nombre?.toLowerCase().includes(query);
+            const a = JSON.parse(c.alias || "[]").some((alias: string) => alias.toLowerCase().includes(query));
+            return n || a;
+          });
+
+          if (matches.length === 0) return `No encuentro a nadie bajo '${args.query}'`;
+          return "Clientes encontrados:\n" + matches.map(c => `${c.id}. ${c.nombre || "Sin nombre"} (${JSON.parse(c.alias || "[]").join(", ")})`).join("\n");
+        }
+      } catch (err: any) {
+        return `Error ejecutando herramienta: ${err.message}`;
       }
-
-      return "Herramienta no reconocida.";
+      return "Error: Herramienta no encontrada.";
     };
 
-    const processWithLLM = async (chatId: number, userText: string) => {
+    const processWithLLM = async (chatId: number, userText: string, audioId?: number) => {
+      console.log(`\n[${new Date().toLocaleTimeString()}] 📥 ENTRADA: "${userText}"`);
+
+      const historyForTurn = getHistory(chatId);
       saveMessage(chatId, "user", userText);
-      const history = getHistory(chatId);
+
+      let currentMessages = [...historyForTurn, { role: "user" as const, content: userText }];
       const nowUnix = Math.floor(Date.now() / 1000);
-      const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
-        {
-          role: "system",
-          content: `Eres Diego, el asistente de un Food Truck en Costa Rica.
-Tu trabajo es registrar pedidos y dar reportes.
-No uses markdown en tus respuestas.
-El timestamp unix actual es: ${nowUnix}
 
-⚠️ REGLA CRÍTICA: La función registrar_pedido requiere TODOS los parámetros: customer, amount, timestamp y paid.
-- Si el operador NO menciona el nombre del cliente → pregúntalo antes de llamar la función.
-- Si el operador NO menciona el monto → pregúntalo antes de llamar la función.
-- Si el operador NO dice si pagó o es fiado → pregúntalo antes de llamar la función.
-- Para el timestamp, usa el timestamp unix actual si no se especifica.
-
-Responde de forma muy breve y directa.`,
-        },
-        ...history.map((h) => ({ role: h.role as "user" | "assistant", content: h.content })),
-      ];
+      const systemPrompt = fs.readFileSync("SYSTEM_PROMPT.txt", "utf-8").replace("%timestamp%", nowUnix.toString()).replace("%audioId%", audioId ? `Audio ID: ${audioId}` : "Sin audio");
 
       try {
-        let response = await openAi.chat.completions.create({
-          model: process.env.OPENAI_MODEL || "gpt-4o",
-          messages,
+        console.log(`[LLM Request] Enviando ${currentMessages.length} mensajes. System length: ${systemPrompt.length}`);
+        let msg = await anthropic.messages.create({
+          model: ANTHROPIC_MODEL,
+          max_tokens: 1024,
+          system: systemPrompt,
+          messages: currentMessages,
           tools,
         });
-        let assistantMessage = response.choices[0].message;
-        if (assistantMessage.tool_calls) {
-          const toolMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [...messages, assistantMessage];
-          for (const toolCall of assistantMessage.tool_calls) {
-            const result = await handleToolCall(chatId, toolCall);
-            toolMessages.push({ role: "tool", tool_call_id: toolCall.id, content: result });
+
+        let hasCompletedTransaction = false;
+
+        while (msg.stop_reason === "tool_use") {
+          saveMessage(chatId, "assistant", msg.content);
+          currentMessages.push({ role: "assistant", content: msg.content as any });
+
+          const toolBlocks = msg.content.filter(b => b.type === "tool_use") as Anthropic.ToolUseBlock[];
+          const toolResults: Anthropic.ToolResultBlockParam[] = [];
+
+          for (const block of toolBlocks) {
+            console.log(`      👉 Herramienta: ${block.name}`);
+            const result = await handleToolCall(chatId, block.name, block.input);
+
+            if (block.name === "registrar_transaccion" && !result.includes("Error")) {
+              hasCompletedTransaction = true;
+            }
+
+            toolResults.push({
+              type: "tool_result",
+              tool_use_id: block.id,
+              content: result,
+            });
           }
-          const secondResponse = await openAi.chat.completions.create({
-            model: process.env.OPENAI_MODEL || "gpt-4o",
-            messages: toolMessages,
+
+          saveMessage(chatId, "user", toolResults);
+          currentMessages.push({ role: "user", content: toolResults });
+
+          msg = await anthropic.messages.create({
+            model: ANTHROPIC_MODEL,
+            max_tokens: 1024,
+            system: systemPrompt,
+            messages: currentMessages,
+            tools,
           });
-          assistantMessage = secondResponse.choices[0].message;
+          console.log(`[LLM Loop] Turno procesado. Siguiente stop_reason: ${msg.stop_reason}`);
         }
-        saveMessage(chatId, "assistant", assistantMessage.content);
-        return assistantMessage.content;
-      } catch (error) {
-        console.error("LLM Error:", error);
-        return "Error al procesar. Intenta de nuevo.";
+
+        const finalResponse = msg.content
+          .filter(b => b.type === "text")
+          .map(b => (b as any).text)
+          .join(" ").trim() || "Operación realizada.";
+
+        saveMessage(chatId, "assistant", msg.content, hasCompletedTransaction);
+        console.log(`   📤 RESPUESTA: "${finalResponse}"\n`);
+        return finalResponse;
+
+      } catch (error: any) {
+        console.error("LLM Error:", error.message);
+        return "Lo siento, tuve un error técnico procesando eso.";
       }
     };
 
-    bot.start((ctx) => ctx.reply("¡Asistente de Food Truck listo! Puedo anotar pedidos (contado/fiado) y darte reportes."));
     bot.on(message("text"), async (ctx) => {
       const reply = await processWithLLM(ctx.chat.id, ctx.message.text);
       ctx.reply(reply);
     });
+
     bot.on(message("voice"), async (ctx) => {
       try {
         const fileId = ctx.message.voice.file_id;
         const link = await ctx.telegram.getFileLink(fileId);
-        const response = await axios({ method: "GET", url: link.href, responseType: "stream" });
+
+        const response = await axios({
+          method: "GET",
+          url: link.href,
+          responseType: "arraybuffer"
+        });
+        const audioBuffer = Buffer.from(response.data);
+
+        const insertAudio = db.prepare(`
+      INSERT OR IGNORE INTO audios (telegram_file_id, audio_data, mime_type) 
+      VALUES (?, ?, ?)
+    `).run(fileId, audioBuffer, ctx.message.voice.mime_type || 'audio/ogg');
+
+        let audioId: number;
+        if (insertAudio.changes > 0) {
+          audioId = insertAudio.lastInsertRowid as number;
+        } else {
+          const existing = db.prepare("SELECT id FROM audios WHERE telegram_file_id = ?").get(fileId) as any;
+          audioId = existing.id;
+        }
+
         const tempFile = `temp_${fileId}.ogg`;
-        await streamPipeline(response.data, fs.createWriteStream(tempFile));
-        const transcription = await groq.audio.transcriptions.create({
+        fs.writeFileSync(tempFile, audioBuffer);
+
+        const trans = await groq.audio.transcriptions.create({
           file: fs.createReadStream(tempFile),
           model: "whisper-large-v3-turbo",
         });
         fs.unlinkSync(tempFile);
-        const text = transcription.text;
-        ctx.reply(`🎤: "${text}"`);
-        const reply = await processWithLLM(ctx.chat.id, text);
-        ctx.reply(reply);
-      } catch (error) {
-        console.error("Transcription Error:", error);
-        ctx.reply("No pude entender el audio.");
+
+        if (trans.text) {
+          ctx.reply(`🎤: "${trans.text}"`);
+          const reply = await processWithLLM(ctx.chat.id, trans.text, audioId);
+          ctx.reply(reply);
+        }
+      } catch (err) {
+        console.error(err);
+        ctx.reply("Error procesando audio.");
       }
     });
 
-    bot.launch()
-      .then(() => {
-        console.log("✅ Telegram Bot started successfully");
-      })
-      .catch((err) => {
-        console.error("❌ Telegram Bot failed to start:");
-        console.error(err.message);
-        console.log("The Dashboard is still running. Check your IPv6/DNS settings.");
-      });
-    process.once("SIGINT", () => bot.stop("SIGINT"));
-    process.once("SIGTERM", () => bot.stop("SIGTERM"));
+    bot.launch();
   }
 
-  // ─── Auth endpoint (público) ─────────────────────────────────────────────
   app.post("/api/login", (req, res) => {
     const { username, password } = req.body;
-    if (username === ADMIN_USER && password === ADMIN_PASS) {
+    if (username === ADMIN_USER && password === ADMIN_PASSWORD) {
       const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: "30d" });
       res.json({ token });
     } else {
@@ -273,19 +372,62 @@ Responde de forma muy breve y directa.`,
     }
   });
 
-  // ─── API protegida ────────────────────────────────────────────────────────
   app.get("/api/health", authMiddleware, (req, res) => {
     res.json({ status: "ok", botStarted: !!botToken });
   });
 
-  app.get("/api/pedidos", authMiddleware, (req, res) => {
-    const last24h = Math.floor(Date.now() / 1000) - 86400;
-    const rows = db.prepare("SELECT * FROM pedidos WHERE timestamp > ? ORDER BY id DESC").all(last24h);
-    res.json(rows);
+  app.get("/api/transactions", authMiddleware, (req, res) => {
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+    const startOfTodayUnix = Math.floor(startOfToday.getTime() / 1000);
+
+    const rows = db.prepare(`
+      SELECT p.*, c.nombre, c.alias
+      FROM transactions p
+      LEFT JOIN customers c ON p.customer_id = c.id
+      WHERE p.timestamp >= ? 
+      ORDER BY p.id DESC
+    `).all(startOfTodayUnix) as any[];
+
+    const formattedRows = rows.map(row => {
+      const name = row.nombre?.trim();
+      let aliases: string[] = [];
+      try {
+        aliases = JSON.parse(row.alias || "[]");
+      } catch (e) {
+        aliases = [];
+      }
+      const aliasStr = aliases.join(", ");
+      let customerLabel = "";
+      if (name && aliasStr) {
+        customerLabel = `${name} (${aliasStr})`;
+      } else if (name) {
+        customerLabel = name;
+      } else if (aliasStr) {
+        customerLabel = aliasStr;
+      } else {
+        customerLabel = `Desconocido (ID: ${row.customer_id})`;
+      }
+      return {
+        id: row.id,
+        chat_id: row.chat_id,
+        customer_id: row.customer_id,
+        amount: row.amount,
+        timestamp: row.timestamp,
+        customer: customerLabel,
+        status: row.status,
+        description: row.description
+      };
+    });
+
+    res.json(formattedRows);
   });
 
   if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa"
+    });
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), "dist");
@@ -293,7 +435,7 @@ Responde de forma muy breve y directa.`,
     app.get("*", (req, res) => res.sendFile(path.join(distPath, "index.html")));
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  httpServer.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
   });
 }

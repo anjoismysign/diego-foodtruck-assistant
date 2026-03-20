@@ -1,5 +1,5 @@
 {
   "name": "AI Telegram Bot",
-  "description": "A Telegram bot that transcribes audio with Groq Whisper and processes messages with OpenAI Compatible LLM, including tool support and conversation history.",
+  "description": "A Telegram bot that transcribes audio with Groq Whisper and processes messages with Anthropic API, including tool support and conversation history.",
   "requestFramePermissions": []
 }
